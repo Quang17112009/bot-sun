@@ -20,7 +20,7 @@ except Exception as e:
     print(f"Lỗi khi khởi động keep_alive: {e}")
 
 # --- CẤU HÌNH BOT ---
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "8024432209:AAF9B1FWDswoGjnHnGKnKLiT4-zXSe6Buc4")
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "7956593401:AAH-7zW1Hyr8Ak6GmEHiKcushkap2FWoxsw")
 ADMIN_ID = 6915752059 # Your ID or the main manager's ID
 API_URL = "https://apisunwin1.up.railway.app/api/taixiu"
 USER_DATA_FILE = 'users.json'
