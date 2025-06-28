@@ -1,670 +1,746 @@
 import telebot
-from telebot import types
-from datetime import datetime, timedelta
-import json
-import time
-import os
+from telebot import types # Import types for inline keyboards
 import requests
-import logging
-from threading import Thread, Lock # Thêm Lock để đồng bộ hóa
-from collections import deque # Để lưu lịch sử phiên
+import time
+import json
+import os
+import random
+import string
+from datetime import datetime, timedelta
+from threading import Thread, Event, Lock
 
-# --- Nhập hàm keep_alive từ file keep_alive.py ---
-try:
-    from keep_alive import keep_alive
-    keep_alive()
-    print("keep_alive đã được khởi động.")
-except ImportError:
-    print("Không tìm thấy file keep_alive.py, bot có thể không giữ được kết nối trên một số nền tảng.")
-except Exception as e:
-    print(f"Lỗi khi khởi động keep_alive: {e}")
+from flask import Flask, request
 
-# --- CẤU HÌNH BOT ---
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "7951251597:AAEXH5OtBRxU8irZSd1S4Gh-jicRmSIOK_s")
-ADMIN_ID = 6915752059 # Your ID or the main manager's ID
-API_URL = "https://apisunwin1.up.railway.app/api/taixiu"
-USER_DATA_FILE = 'users.json'
-PREDICTION_MODEL_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent?key="
-GEMINI_API_KEY = "AIzaSyCTTMzSPnYiSP8go0EMko9YOBC7X0jFLL4" # Your Gemini API Key
-POLLING_INTERVAL = 10 # Thời gian chờ giữa các lần kiểm tra phiên mới (giây)
-HISTORY_LENGTH = 100 # Số lượng phiên lịch sử để lưu trữ cho dự đoán
+# --- Cấu hình Bot (ĐẶT TRỰC TIẾP TẠY ĐÂY) ---
+# THAY THẾ 'YOUR_BOT_TOKEN_HERE' BẰNG TOKEN THẬT CỦA BẠN
+BOT_TOKEN = "7820739987:AAE_eU2JPZH7u6KnDRq31_l4tn64AD_8f6s" 
+# THAY THẾ BẰNG ID ADMIN GỐC CỦA BẠN. Admin gốc này sẽ có quyền thêm/xóa admin khác.
+# CHỈ CẦN MỘT ID ADMIN BAN ĐẦU ĐỂ KHỞI TẠO. CÁC ADMIN KHÁC SẼ ĐƯỢC QUẢN LÝ QUA LỆNH.
+SUPER_ADMIN_IDS = [6915752059] 
 
-bot = telebot.TeleBot(TOKEN)
+DATA_FILE = 'user_data.json'
+KEYS_FILE = 'keys.json'
 
-# --- LOGGING SETUP ---
-logging.basicConfig(level=logging.INFO, filename='bot.log', format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# --- Khởi tạo Flask App và Telegram Bot ---
+app = Flask(__name__)
+bot = telebot.TeleBot(BOT_TOKEN)
 
-# --- GLOBAL VARIABLES & DATA MANAGEMENT ---
-user_data = {} # Stores user_id -> { 'expires': datetime, 'role': 'user'/'ctv', 'last_active': datetime, 'notify_enabled': bool }
-session_history = deque(maxlen=HISTORY_LENGTH) # Deque để lưu trữ lịch sử phiên
-last_notified_session_id = 0 # ID của phiên cuối cùng đã được thông báo
-data_lock = Lock() # Khóa để bảo vệ user_data và session_history khi truy cập đa luồng
+# Global flags và objects
+bot_enabled_global = True # Cờ tắt/mở bot toàn cục bởi admin
+bot_disable_reason_global = "Không có"
+bot_initialized = False # Cờ để đảm bảo bot chỉ được khởi tạo một lần
+bot_init_lock = Lock() # Khóa để tránh race condition khi khởi tạo
 
+# Global data containers
+user_data = {} # {user_id: {...}}
+generated_keys = {} # {key_string: {...}}
+prediction_history = { # Lưu 10 phiên gần nhất cho mỗi game
+    "LuckyWin": [],
+    "SunWin": [],
+    "B52": [],
+    "Hit": []
+}
+
+# --- API Endpoints for each game ---
+GAME_APIS = {
+    "LuckyWin": "https://apiluck.onrender.com/api/taixiu",
+    "SunWin": "https://apisun.onrender.com/api/taixiu",
+    "B52": "https://apib52-8y5h.onrender.com/api/taixiu",
+    "Hit": "https://apihit-v17r.onrender.com/api/taixiu"
+}
+
+# --- Quản lý dữ liệu người dùng và keys ---
 def load_user_data():
     global user_data
-    if os.path.exists(USER_DATA_FILE):
-        with open(USER_DATA_FILE, 'r') as f:
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r') as f:
             try:
-                data = json.load(f)
-                user_data = {
-                    int(uid): {
-                        'expires': datetime.fromisoformat(u['expires']) if 'expires' in u and u['expires'] else None,
-                        'role': u.get('role', 'user'),
-                        'last_active': datetime.fromisoformat(u['last_active']) if 'last_active' in u and u['last_active'] else None,
-                        'notify_enabled': u.get('notify_enabled', False) # Thêm trạng thái bật/tắt thông báo
-                    } for uid, u in data.items()
-                }
-                logger.info(f"Loaded {len(user_data)} users from {USER_DATA_FILE}")
-            except json.JSONDecodeError as e:
-                logger.error(f"Error loading user data: {e}. Starting with empty data.")
+                user_data = json.load(f)
+            except json.JSONDecodeError:
+                print(f"Lỗi đọc {DATA_FILE}. Khởi tạo lại dữ liệu người dùng.")
                 user_data = {}
     else:
-        logger.info(f"User data file {USER_DATA_FILE} not found. Starting with empty data.")
+        user_data = {}
+    print(f"Loaded {len(user_data)} user records from {DATA_FILE}")
+    # Đảm bảo super admin luôn có quyền admin trong user_data
+    for admin_id in SUPER_ADMIN_IDS:
+        user_id_str = str(admin_id)
+        if user_id_str not in user_data:
+            user_data[user_id_str] = {'username': 'Super Admin', 'expiry_date': None, 'is_admin': True, 'receiving_predictions': False, 'preferred_game': None}
+        else:
+            user_data[user_id_str]['is_admin'] = True # Đảm bảo admin gốc luôn là admin
+    save_user_data(user_data) # Lưu lại để cập nhật trạng thái admin
 
-def save_user_data():
-    with open(USER_DATA_FILE, 'w') as f:
-        serializable_data = {
-            uid: {
-                'expires': u['expires'].isoformat() if u['expires'] else None,
-                'role': u.get('role', 'user'),
-                'last_active': u['last_active'].isoformat() if u['last_active'] else None,
-                'notify_enabled': u.get('notify_enabled', False)
-            } for uid, u in user_data.items()
-        }
-        json.dump(serializable_data, f, indent=4)
-        logger.info("User data saved.")
+def save_user_data(data):
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
 
-# Load data on startup
-load_user_data()
-
-# --- HELPER FUNCTIONS ---
-
-def get_user_status(user_id):
-    now = datetime.now()
-    user = user_data.get(user_id, {})
-    expires = user.get('expires')
-    role = user.get('role', 'user')
-
-    if expires is None:
-        return 'trial', role
-    elif expires > now:
-        return 'active', role
+def load_keys():
+    global generated_keys
+    if os.path.exists(KEYS_FILE):
+        with open(KEYS_FILE, 'r') as f:
+            try:
+                generated_keys = json.load(f)
+            except json.JSONDecodeError:
+                print(f"Lỗi đọc {KEYS_FILE}. Khởi tạo lại mã key.")
+                generated_keys = {}
     else:
-        return 'expired', role
+        generated_keys = {}
+    print(f"Loaded {len(generated_keys)} keys from {KEYS_FILE}")
 
-def update_user_activity(user_id):
-    with data_lock:
-        if user_id not in user_data:
-            user_data[user_id] = {'expires': None, 'role': 'user', 'notify_enabled': False}
-        user_data[user_id]['last_active'] = datetime.now()
-        save_user_data()
+def save_keys():
+    with open(KEYS_FILE, 'w') as f:
+        json.dump(generated_keys, f, indent=4)
 
 def is_admin(user_id):
-    return user_id == ADMIN_ID
+    user_id_str = str(user_id)
+    return user_data.get(user_id_str, {}).get('is_admin', False)
 
-def is_ctv(user_id):
-    with data_lock:
-        return user_data.get(user_id, {}).get('role') == 'ctv' or is_admin(user_id)
+def check_key_validity(user_id):
+    user_id_str = str(user_id)
+    if is_admin(user_id):
+        return True, "Bạn là Admin, quyền truy cập vĩnh viễn."
 
-def has_access(user_id):
-    with data_lock:
-        if is_admin(user_id) or is_ctv(user_id):
-            return True
+    if user_id_str not in user_data or user_data[user_id_str].get('expiry_date') is None:
+        return False, "⚠️ Bạn chưa kích hoạt bot bằng key hoặc key đã hết hạn."
 
-        status, _ = get_user_status(user_id)
-        return status == 'active'
+    expiry_date_str = user_data[user_id_str]['expiry_date']
+    expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d %H:%M:%S')
 
-def fetch_tai_xiu_data():
-    try:
-        response = requests.get(API_URL, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        logger.info(f"Fetched Tai Xiu data: {data}")
-        return data
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching Tai Xiu data: {e}")
+    if datetime.now() < expiry_date:
+        remaining_time = expiry_date - datetime.now()
+        days = remaining_time.days
+        hours = remaining_time.seconds // 3600
+        minutes = (remaining_time.seconds % 3600) // 60
+        seconds = remaining_time.seconds % 60
+        return True, f"✅ Key của bạn còn hạn đến: `{expiry_date_str}` ({days} ngày {hours} giờ {minutes} phút {seconds} giây)."
+    else:
+        return False, "❌ Key của bạn đã hết hạn."
+
+# --- Hàm lấy và phân tích dữ liệu từ các API khác nhau ---
+def fetch_and_parse_api_data(game_name):
+    api_url = GAME_APIS.get(game_name)
+    if not api_url:
+        print(f"Không tìm thấy API cho game: {game_name}")
         return None
 
-# --- THUẬT TOÁN DỰ ĐOÁN SIÊU CHÍNH XÁC (MỚI) ---
-def predict_tai_xiu_advanced(history_data):
-    if not history_data:
-        return "Không có đủ dữ liệu để dự đoán.", "unknown"
+    try:
+        response = requests.get(api_url)
+        response.raise_for_status()
+        data = response.json()
 
-    # Bước 1: Chuẩn bị dữ liệu lịch sử cho Gemini
-    # Cung cấp 30 phiên gần nhất cho Gemini
-    recent_results = []
-    for entry in list(history_data)[-30:]: # Lấy 30 phiên gần nhất
-        recent_results.append({
-            "phien": entry['Phien'],
-            "tong": entry['Tong'],
-            "ket_qua": entry['Ket_qua']
-        })
-    
-    # Đảo ngược để phiên mới nhất ở cuối, phù hợp với cách Gemini học
-    recent_results.reverse()
+        parsed_data = {}
+        if game_name == "LuckyWin":
+            parsed_data["current_session"] = data.get("Ma_phien_hien_tai")
+            parsed_data["current_result"] = data.get("Ket_qua_phien_hien_tai")
+            parsed_data["total_score"] = data.get("Tong_diem_hien_tai")
+            parsed_data["dice_values"] = data.get("Xuc_xac_hien_tai")
+            
+            prediction_data = data.get("Du_doan_phien_tiep_theo_ML", {})
+            parsed_data["next_prediction"] = prediction_data.get("Ket_qua_du_doan")
+            parsed_data["confidence"] = prediction_data.get("Do_tin_cay")
+            
+        elif game_name in ["SunWin", "B52", "Hit"]:
+            # Cả ba game này có định dạng tương tự
+            parsed_data["current_session"] = data.get("current_session")
+            parsed_data["current_result"] = data.get("current_result")
+            parsed_data["total_score"] = None # API này không trả về tổng điểm trực tiếp
+            parsed_data["dice_values"] = None # API này không trả về giá trị xí ngầu
+            
+            parsed_data["next_prediction"] = data.get("prediction")
+            parsed_data["confidence"] = f"{data.get('confidence_percent', 0.0)}%" # Thêm %
 
-    # Bước 2: Dự đoán bằng Gemini AI
-    gemini_prediction_text = "Không thể dự đoán."
-    gemini_certainty = "unknown" # Để biết Gemini đưa ra kết quả Tài hay Xỉu
-
-    if recent_results:
-        prompt_history = "\n".join([
-            f"Phiên {r['phien']}: Tổng {r['tong']}, Kết quả {r['ket_qua']}"
-            for r in recent_results
-        ])
+        # Xử lý mã hóa cho kết quả và dự đoán
+        if parsed_data.get("current_result"):
+            parsed_data["current_result"] = parsed_data["current_result"].replace("TÃ i", "Tài").replace("Xá»‰u", "Xỉu").replace("X\u1ec9u", "Xỉu")
+        if parsed_data.get("next_prediction"):
+            parsed_data["next_prediction"] = parsed_data["next_prediction"].replace("TÃ i", "Tài").replace("Xá»‰u", "Xỉu").replace("X\u1ec9u", "Xỉu")
         
-        contents = [
-            {"role": "user", "parts": [
-                f"Trò chơi có quy tắc: Tổng 3 xúc xắc > 10 là 'Tài', ngược lại là 'Xỉu'. Dựa vào lịch sử các phiên sau, dự đoán kết quả (Tài/Xỉu) của phiên tiếp theo. Chỉ trả lời 'Tài' hoặc 'Xỉu'.\nLịch sử:\n{prompt_history}"
-            ]}
-        ]
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": contents,
-            "generationConfig": {
-                "temperature": 0.7, # Điều chỉnh để có sự ngẫu nhiên nhưng vẫn hợp lý
-                "maxOutputTokens": 10 # Chỉ cần Tài hoặc Xỉu
-            }
-        }
+        return parsed_data
+    except requests.exceptions.RequestException as e:
+        print(f"Lỗi khi lấy dữ liệu từ API {game_name}: {e}")
+        return None
+    except json.JSONDecodeError:
+        print(f"Lỗi giải mã JSON từ API {game_name}. Phản hồi không phải JSON hợp lệ.")
+        return None
+    except Exception as e:
+        print(f"Lỗi không xác định khi xử lý API {game_name}: {e}")
+        return None
 
-        try:
-            gemini_response = requests.post(f"{PREDICTION_MODEL_URL}{GEMINI_API_KEY}", headers=headers, json=payload, timeout=15)
-            gemini_response.raise_for_status()
-            prediction_data = gemini_response.json()
-            
-            gemini_prediction_text = prediction_data.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', 'Không thể dự đoán.').strip()
-            
-            if "Tài" in gemini_prediction_text:
-                gemini_certainty = "Tài"
-            elif "Xỉu" in gemini_prediction_text:
-                gemini_certainty = "Xỉu"
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error calling Gemini API for prediction: {e}")
-            gemini_prediction_text = "Lỗi API dự đoán."
-        except Exception as e:
-            logger.error(f"Unexpected error in Gemini prediction: {e}")
-            gemini_prediction_text = "Lỗi nội bộ AI."
+# --- Logic chính của Bot dự đoán (chạy trong luồng riêng) ---
+def prediction_loop(stop_event: Event):
+    # Sử dụng dictionary để lưu last_issue_id cho từng game
+    last_issue_ids = {game_name: None for game_name in GAME_APIS.keys()}
+    global prediction_history
+    
+    print("Prediction loop started.")
+    while not stop_event.is_set():
+        if not bot_enabled_global:
+            time.sleep(10)
+            continue
 
-    # Bước 3: Thuật toán thống kê cục bộ (Mô phỏng AI thứ hai học hỏi)
-    # Đây là một ví dụ thuật toán đơn giản dựa trên tần suất và chuỗi
-    tai_count = 0
-    xiu_count = 0
-    for entry in history_data:
-        if entry['Ket_qua'] == 'Tài':
-            tai_count += 1
-        elif entry['Ket_qua'] == 'Xỉu':
-            xiu_count += 1
+        # Lấy danh sách các game mà người dùng đang theo dõi
+        active_games = set()
+        for user_id_str, user_info in user_data.items():
+            if user_info.get('receiving_predictions', False) and user_info.get('preferred_game'):
+                active_games.add(user_info['preferred_game'])
+        
+        if not active_games:
+            # print("Không có người dùng nào đang nhận dự đoán. Ngủ...")
+            time.sleep(5)
+            continue
 
-    last_n_results = [entry['Ket_qua'] for entry in list(history_data)[-5:]] # 5 phiên gần nhất
-    
-    local_prediction = "unknown"
-    
-    # Rule-based logic (ví dụ đơn giản, có thể phức tạp hơn)
-    if tai_count > xiu_count * 1.5 and len(history_data) > 20: # Nếu Tài chiếm ưu thế đáng kể
-        local_prediction = "Tài"
-    elif xiu_count > tai_count * 1.5 and len(history_data) > 20: # Nếu Xỉu chiếm ưu thế đáng kể
-        local_prediction = "Xỉu"
-    
-    # Phát hiện chuỗi
-    if len(last_n_results) >= 3:
-        if all(res == "Tài" for res in last_n_results[-3:]):
-            local_prediction = "Tài" # Nếu có 3 Tài liên tiếp, dự đoán tiếp theo là Tài
-        elif all(res == "Xỉu" for res in last_n_results[-3:]):
-            local_prediction = "Xỉu" # Nếu có 3 Xỉu liên tiếp, dự đoán tiếp theo là Xỉu
-    
-    # Bước 4: Kết hợp kết quả từ Gemini và thuật toán cục bộ
-    # Đây là nơi bạn định nghĩa "siêu chính xác nhất"
-    # Một cách đơn giản là ưu tiên Gemini nếu nó đưa ra kết quả rõ ràng,
-    # nếu không thì dùng thuật toán cục bộ.
-    
-    final_prediction = "Không thể dự đoán."
-    
-    if gemini_certainty != "unknown":
-        final_prediction = gemini_certainty
-    elif local_prediction != "unknown":
-        final_prediction = local_prediction
-    else:
-        # Nếu cả hai không đưa ra kết quả mạnh mẽ, dùng AI của bạn để đưa ra quyết định cuối
-        # ví dụ: dựa trên xác suất đơn giản từ tần suất nếu không có quy tắc nào khớp
-        if tai_count > xiu_count:
-            final_prediction = "Tài"
-        elif xiu_count > tai_count:
-            final_prediction = "Xỉu"
-        elif len(history_data) > 0: # 50/50 nếu bằng nhau, hoặc dựa vào phiên cuối cùng
-             final_prediction = history_data[-1]['Ket_qua'] # Dự đoán là lặp lại kết quả cuối cùng
+        # Duyệt qua từng game đang có người dùng theo dõi để fetch data
+        for game_name in active_games:
+            parsed_data = fetch_and_parse_api_data(game_name)
+            if not parsed_data:
+                # print(f"❌ Không lấy được dữ liệu từ API {game_name} hoặc dữ liệu không hợp lệ.")
+                continue
 
-    return final_prediction, gemini_prediction_text # Trả về cả dự đoán cuối cùng và dự đoán của Gemini
+            current_issue_id = parsed_data.get("current_session")
+            current_result = parsed_data.get("current_result")
+            current_total = parsed_data.get("total_score")
+            current_dice = parsed_data.get("dice_values")
+            next_prediction = parsed_data.get("next_prediction")
+            confidence = parsed_data.get("confidence")
 
-# --- TELEGRAM BOT HANDLERS ---
+            if not all([current_issue_id, current_result, next_prediction, confidence]):
+                print(f"Dữ liệu API {game_name} không đầy đủ. Bỏ qua phiên này.")
+                continue
+
+            if current_issue_id != last_issue_ids[game_name]:
+                # Tìm phiên tiếp theo (tăng ID lên 1)
+                try:
+                    next_issue_id = str(int(current_issue_id) + 1).zfill(len(str(current_issue_id)))
+                except ValueError:
+                    next_issue_id = "Phiên tiếp theo" # Hoặc xử lý lỗi phù hợp hơn
+                
+                # Lưu vào lịch sử phiên của game tương ứng
+                if len(prediction_history[game_name]) >= 10:
+                    prediction_history[game_name].pop(0) 
+                
+                dice_str = f"({', '.join(map(str, current_dice))})" if current_dice else ""
+                total_str = f" (Tổng: **{current_total}**)" if current_total else ""
+
+                prediction_history[game_name].append(
+                    f"Phiên: `{current_issue_id}` | KQ: **{current_result}**{total_str} {dice_str}"
+                )
+
+                # Gửi tin nhắn dự đoán tới các người dùng đang theo dõi game này
+                for user_id_str, user_info in list(user_data.items()):
+                    user_id = int(user_id_str)
+                    if user_info.get('receiving_predictions', False) and user_info.get('preferred_game') == game_name:
+                        is_sub, sub_message = check_key_validity(user_id)
+                        if is_sub:
+                            try:
+                                prediction_message = (
+                                    f"🎮 **KẾT QUẢ PHIÊN HIỆN TẠI - {game_name.upper()}** 🎮\n"
+                                    f"Phiên: `{current_issue_id}` | Kết quả: **{current_result}**{total_str} {dice_str}\n\n"
+                                    f"**Dự đoán cho phiên tiếp theo:**\n"
+                                    f"🔢 Phiên: `{next_issue_id}`\n"
+                                    f"🤖 Dự đoán: **{next_prediction}**\n"
+                                    f"📈 Độ tin cậy: **{confidence}**\n"
+                                    f"⚠️ **Hãy đặt cược sớm trước khi phiên kết thúc!**"
+                                )
+                                bot.send_message(user_id, prediction_message, parse_mode='Markdown')
+                            except telebot.apihelper.ApiTelegramException as e:
+                                if "bot was blocked by the user" in str(e) or "user is deactivated" in str(e):
+                                    print(f"Người dùng {user_id} đã chặn bot hoặc bị vô hiệu hóa.")
+                                else:
+                                    print(f"Lỗi gửi tin nhắn cho user {user_id}: {e}")
+                            except Exception as e:
+                                print(f"Lỗi không xác định khi gửi tin nhắn cho user {user_id}: {e}")
+
+                print("-" * 50)
+                print(f"Game: {game_name}")
+                print(f"🎮 Kết quả phiên hiện tại: {current_issue_id} | {current_result}{total_str} {current_dice}")
+                print(f"🔢 Phiên tiếp theo: {next_issue_id}")
+                print(f"🤖 Dự đoán: {next_prediction}")
+                print(f"📈 Độ tin cậy: {confidence}")
+                print("⚠️ Hãy đặt cược sớm trước khi phiên kết thúc!")
+                print("-" * 50)
+
+                last_issue_ids[game_name] = current_issue_id
+
+        time.sleep(5) # Đợi 5 giây trước khi kiểm tra phiên mới
+    print("Prediction loop stopped.")
+
+# --- Xử lý lệnh Telegram ---
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    update_user_activity(message.chat.id)
-    bot.send_message(message.chat.id, "Chào mừng bạn đến với BOT TÀI XỈU SUNWIN! 🎉\n\nSử dụng lệnh /help để xem các lệnh có sẵn.")
+    user_id = str(message.chat.id)
+    username = message.from_user.username or message.from_user.first_name
+    
+    if user_id not in user_data:
+        user_data[user_id] = {
+            'username': username,
+            'expiry_date': None,
+            'is_admin': False, 
+            'receiving_predictions': False,
+            'preferred_game': None # Thêm trường này
+        }
+        save_user_data(user_data)
+        bot.reply_to(message, 
+                     "Chào mừng bạn đến với **BOT DỰ ĐOÁN TÀI XỈU ĐA NỀN TẢNG**!\n"
+                     "Để bắt đầu sử dụng, hãy nhập key bằng lệnh `/key <mã_key>`.\n"
+                     "Dùng lệnh /help để xem danh sách các lệnh hỗ trợ.", 
+                     parse_mode='Markdown')
+    else:
+        user_data[user_id]['username'] = username 
+        save_user_data(user_data)
+        bot.reply_to(message, "Bạn đã khởi động bot rồi. Dùng /help để xem các lệnh.")
 
 @bot.message_handler(commands=['help'])
-def send_help(message):
-    update_user_activity(message.chat.id)
-    help_text = """
-Chào mừng bạn đến với BOT TÀI XỈU SUNWIN! Tôi có thể giúp bạn dự đoán kết quả Tài Xỉu và cung cấp thông tin liên quan.
-
-Các lệnh có sẵn:
-/start - Bắt đầu và nhận lời chào.
-/help - Hiển thị danh sách các lệnh này.
-/du_doan - Dự đoán kết quả Tài Xỉu cho phiên tiếp theo và nhận thông báo liên tục.
-/tat_thong_bao - Tắt thông báo tự động dự đoán.
-/bat_thong_bao - Bật lại thông báo tự động dự đoán.
-/gia - Xem bảng giá dịch vụ của bot.
-/nap - Hướng dẫn nạp tiền để mua lượt hoặc gia hạn.
-/gopy <nội dung> - Gửi góp ý tới admin.
-/support - Liên hệ hỗ trợ.
-
----
-💰 **Dành cho quản lý (Admin/CTV):**
-/full - Xem chi tiết thông tin người dùng (chỉ Admin/CTV).
-/giahan <user_id> <số_ngày> - Gia hạn cho người dùng (chỉ Admin/CTV).
-/ctv <user_id> - Cấp quyền CTV cho người dùng (chỉ Admin).
-/xoactv <user_id> - Xóa quyền CTV của người dùng (chỉ Admin).
-/tb <nội dung> - Gửi thông báo đến tất cả người dùng (chỉ Admin).
-"""
-    bot.send_message(message.chat.id, help_text)
-
-@bot.message_handler(commands=['support'])
-def send_support_info(message):
-    update_user_activity(message.chat.id)
-    support_text = """
-📧 **Hỗ trợ:**
-Nếu bạn có bất kỳ vấn đề hoặc câu hỏi nào, vui lòng liên hệ:
-- Telegram Admin: @heheviptool
-- Email: nhutquangdzs1@gmail.com
-"""
-    bot.send_message(message.chat.id, support_text)
-
-@bot.message_handler(commands=['gia'])
-def send_pricing(message):
-    update_user_activity(message.chat.id)
-    pricing_text = """
-BOT SUNWIN XIN THÔNG BÁO BẢNG GIÁ SUN BOT
-----------------------------------
-💰 **Bảng Giá Dịch Vụ:**
-- 20k 1 Ngày
-- 50k 1 Tuần
-- 80k 2 Tuần
-- 130k 1 Tháng
-
-📊 **BOT SUN TỈ Lệ 85-92%**
-🕒 ĐỌC 24/24
-
-Vui Lòng ib @heheviptool Để Gia Hạn.
-"""
-    bot.send_message(message.chat.id, pricing_text)
-
-@bot.message_handler(commands=['nap'])
-def send_nap_info(message):
-    update_user_activity(message.chat.id)
-    nap_text = f"""
-⚜️ NẠP TIỀN MUA LƯỢT ⚜️
-
-Để mua lượt, vui lòng chuyển khoản đến:
-- Ngân hàng: **MB BANK**
-- Số tài khoản: **0939766383**
-- Tên chủ TK: **Nguyen Huynh Nhut Quang**
-
-NỘI DUNG CHUYỂN KHOẢN (QUAN TRỌNG):
-`mua luot {message.chat.id}`
-
-❗️ Nội dung bắt buộc của bạn là:
-`mua luot {message.chat.id}`
-
-(Vui lòng sao chép đúng nội dung trên để được cộng lượt tự động)
-Sau khi chuyển khoản, vui lòng chờ 1-2 phút và kiểm tra bằng lệnh /luot (lệnh này hiện chưa có, vui lòng liên hệ hỗ trợ nếu cần). Nếu có sự cố, hãy dùng lệnh /support.
-"""
-    bot.send_message(message.chat.id, nap_text)
-
-@bot.message_handler(commands=['gopy'])
-def receive_feedback(message):
-    update_user_activity(message.chat.id)
-    feedback_text = message.text[len('/gopy '):].strip()
-    if not feedback_text:
-        bot.send_message(message.chat.id, "Vui lòng nhập nội dung góp ý sau lệnh /gopy. Ví dụ: `/gopy bot rất hữu ích!`")
-        return
-
-    admin_message = f"📢 **Góp ý từ người dùng {message.from_user.first_name} (ID: {message.chat.id}):**\n\n{feedback_text}"
-    try:
-        bot.send_message(ADMIN_ID, admin_message)
-        bot.send_message(message.chat.id, "Cảm ơn bạn đã gửi góp ý! Admin đã nhận được nội dung của bạn.")
-        logger.info(f"Feedback from {message.chat.id}: {feedback_text}")
-    except Exception as e:
-        bot.send_message(message.chat.id, "Có lỗi xảy ra khi gửi góp ý. Vui lòng thử lại sau hoặc liên hệ /support.")
-        logger.error(f"Error sending feedback to admin {ADMIN_ID}: {e}")
-
-@bot.message_handler(commands=['du_doan'])
-def handle_prediction_request(message):
-    update_user_activity(message.chat.id)
-    user_id = message.chat.id
-    if not has_access(user_id):
-        status, _ = get_user_status(user_id)
-        if status == 'expired':
-            bot.send_message(user_id, "Rất tiếc, tài khoản của bạn đã hết hạn sử dụng. Vui lòng /nap để gia hạn hoặc liên hệ /support.")
-        else:
-             bot.send_message(user_id, "Bạn chưa đăng ký dịch vụ để sử dụng tính năng dự đoán. Vui lòng /gia để xem bảng giá và /nap để mua lượt.")
-        return
-
-    with data_lock:
-        user_data[user_id]['notify_enabled'] = True
-        save_user_data()
-
-    bot.send_message(user_id, "Đã bật chế độ tự động dự đoán và thông báo liên tục. Vui lòng chờ phiên mới nhất!")
-    # Gửi ngay dự đoán đầu tiên nếu có dữ liệu
-    send_latest_prediction_to_user(user_id)
-
-
-@bot.message_handler(commands=['tat_thong_bao'])
-def disable_notifications(message):
-    update_user_activity(message.chat.id)
-    user_id = message.chat.id
-    with data_lock:
-        if user_id in user_data:
-            user_data[user_id]['notify_enabled'] = False
-            save_user_data()
-            bot.send_message(user_id, "Đã tắt thông báo tự động dự đoán. Bạn sẽ không nhận được tin nhắn về các phiên mới nữa.")
-        else:
-            bot.send_message(user_id, "Bạn chưa có thông báo nào được bật.")
-
-@bot.message_handler(commands=['bat_thong_bao'])
-def enable_notifications(message):
-    update_user_activity(message.chat.id)
-    user_id = message.chat.id
-    if not has_access(user_id):
-        status, _ = get_user_status(user_id)
-        if status == 'expired':
-            bot.send_message(user_id, "Rất tiếc, tài khoản của bạn đã hết hạn sử dụng. Vui lòng /nap để gia hạn hoặc liên hệ /support.")
-        else:
-             bot.send_message(user_id, "Bạn chưa đăng ký dịch vụ để sử dụng tính năng dự đoán. Vui lòng /gia để xem bảng giá và /nap để mua lượt.")
-        return
-
-    with data_lock:
-        if user_id not in user_data:
-            user_data[user_id] = {'expires': None, 'role': 'user', 'last_active': None, 'notify_enabled': True}
-        user_data[user_id]['notify_enabled'] = True
-        save_user_data()
+def show_help(message):
+    help_text = (
+        "🔔 **HƯỚNG DẪN SỬ DỤNG BOT**\n"
+        "══════════════════════════\n"
+        "🔑 **Lệnh cơ bản:**\n"
+        "🔸 `/start`: Hiển thị thông tin chào mừng\n"
+        "🔸 `/key <key>`: Nhập key để kích hoạt bot\n"
+        "🔸 `/chaybot`: Bật nhận thông báo và chọn game\n"
+        "🔸 `/tatbot`: Tắt nhận thông báo dự đoán\n"
+        "🔸 `/lichsu [tên_game]`: Xem lịch sử 10 phiên gần nhất của game (mặc định game đang chọn)\n"
+    )
     
-    bot.send_message(user_id, "Đã bật thông báo tự động dự đoán. Bạn sẽ nhận được dự đoán liên tục khi có phiên mới.")
-    send_latest_prediction_to_user(user_id)
+    if is_admin(message.chat.id):
+        help_text += (
+            "══════════════════════════\n"
+            "🛡️ **Lệnh Admin:**\n"
+            "🔹 `/taokey <giá_trị> <đơn_vị> [số_lượng]`\n"
+            "   Ví dụ: `/taokey 1 ngày 5` (tạo 5 key 1 ngày)\n"
+            "🔹 `/lietkekey`: Liệt kê tất cả key\n"
+            "🔹 `/xoakey <key>`: Xóa key\n"
+            "🔹 `/themadmin <id>`: Thêm admin\n"
+            "🔹 `/xoaadmin <id>`: Xóa admin\n"
+            "🔹 `/danhsachadmin`: Xem danh sách admin\n"
+            "🔹 `/broadcast <tin nhắn>`: Gửi thông báo đến tất cả người dùng\n"
+            "🔹 `/tatbot_global <lý do>`: Tắt bot dự đoán toàn cục\n"
+            "🔹 `/mokbot_global`: Mở lại bot dự đoán toàn cục\n"
+        )
+    
+    help_text += (
+        "══════════════════════════\n"
+        "👥 Liên hệ Admin để được hỗ trợ thêm:\n"
+        "@heheviptool hoặc @Besttaixiu999"
+    )
+    
+    bot.reply_to(message, help_text, parse_mode='Markdown')
 
+@bot.message_handler(commands=['key'])
+def use_key_command(message):
+    key_str = telebot.util.extract_arguments(message.text)
+    user_id = str(message.chat.id)
 
-@bot.message_handler(commands=['full'])
-def get_full_user_info(message):
-    update_user_activity(message.chat.id)
-    if not is_ctv(message.chat.id):
-        bot.send_message(message.chat.id, "Bạn không có quyền sử dụng lệnh này.")
+    if not key_str:
+        bot.reply_to(message, "Vui lòng nhập key. Ví dụ: `/key ABCXYZ`", parse_mode='Markdown')
+        return
+    
+    if key_str not in generated_keys:
+        bot.reply_to(message, "❌ Key không tồn tại hoặc không hợp lệ.")
         return
 
-    response_text = "📊 **Thông tin chi tiết người dùng:**\n\n"
-    with data_lock:
-        if not user_data:
-            response_text += "Chưa có dữ liệu người dùng nào."
+    key_info = generated_keys[key_str]
+    
+    if key_info.get('limit') is not None and key_info.get('used_count', 0) >= key_info['limit']:
+        bot.reply_to(message, "❌ Key này đã đạt giới hạn số lần sử dụng.")
+        return
+
+    # Apply extension
+    current_expiry_str = user_data.get(user_id, {}).get('expiry_date')
+    if current_expiry_str:
+        current_expiry_date = datetime.strptime(current_expiry_str, '%Y-%m-%d %H:%M:%S')
+        # If current expiry is in the past, start from now
+        if datetime.now() > current_expiry_date:
+            new_expiry_date = datetime.now()
         else:
-            for uid, info in user_data.items():
-                status, role = get_user_status(uid)
-                expires_str = info['expires'].strftime("%Y-%m-%d %H:%M:%S") if info['expires'] else "Chưa gia hạn"
-                last_active_str = info['last_active'].strftime("%Y-%m-%d %H:%M:%S") if info['last_active'] else "Chưa hoạt động"
-                notify_status = "Bật" if info.get('notify_enabled') else "Tắt"
-                
-                response_text += f"**ID:** `{uid}`\n" \
-                                f"  **Trạng thái:** {status.capitalize()}\n" \
-                                f"  **Quyền:** {role.capitalize()}\n" \
-                                f"  **Hạn sử dụng:** {expires_str}\n" \
-                                f"  **Hoạt động cuối:** {last_active_str}\n" \
-                                f"  **Thông báo:** {notify_status}\n" \
-                                f"--------------------\n"
+            new_expiry_date = current_expiry_date
+    else:
+        new_expiry_date = datetime.now() # Start from now if no previous expiry
+
+    value = key_info['value']
+    if key_info['unit'] == 'ngày':
+        new_expiry_date += timedelta(days=value)
+    elif key_info['unit'] == 'giờ':
+        new_expiry_date += timedelta(hours=value)
+    
+    # Cập nhật thông tin user
+    user_data.setdefault(user_id, {})['expiry_date'] = new_expiry_date.strftime('%Y-%m-%d %H:%M:%S')
+    user_data[user_id]['username'] = message.from_user.username or message.from_user.first_name
+    
+    # Cập nhật thông tin key
+    key_info['used_count'] = key_info.get('used_count', 0) + 1
+    key_info['activated_by'] = user_id
+    key_info['activated_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    save_user_data(user_data)
+    save_keys()
+
+    bot.reply_to(message, 
+                 f"🎉 Bạn đã đổi key thành công! Tài khoản của bạn đã được gia hạn thêm **{value} {key_info['unit']}**.\n"
+                 f"Ngày hết hạn mới: `{get_user_expiry_date(user_id)}`", 
+                 parse_mode='Markdown')
+
+def get_user_expiry_date(user_id):
+    if str(user_id) in user_data and user_data[str(user_id)].get('expiry_date'):
+        return user_data[str(user_id)]['expiry_date']
+    return "Không có"
+
+@bot.message_handler(commands=['chaybot'])
+def prompt_game_selection(message):
+    user_id = str(message.chat.id)
+    is_valid_key, msg = check_key_validity(message.chat.id)
+
+    if not is_valid_key:
+        bot.reply_to(message, msg + "\nVui lòng kích hoạt bot bằng key trước. Dùng `/key <mã_key>`.", parse_mode='Markdown')
+        return
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    for game_name in GAME_APIS.keys():
+        markup.add(types.InlineKeyboardButton(game_name, callback_data=f"select_game_{game_name}"))
+    
+    bot.reply_to(message, "✅ Bạn có quyền truy cập. Vui lòng chọn game bạn muốn nhận dự đoán:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('select_game_'))
+def callback_select_game(call):
+    user_id = str(call.message.chat.id)
+    game_name = call.data.replace('select_game_', '')
+
+    if game_name not in GAME_APIS:
+        bot.send_message(call.message.chat.id, "Game không hợp lệ. Vui lòng thử lại.")
+        return
+
+    # Kích hoạt nhận dự đoán và lưu game ưu tiên
+    user_data.setdefault(user_id, {})['receiving_predictions'] = True
+    user_data[user_id]['preferred_game'] = game_name
+    save_user_data(user_data)
+
+    bot.edit_message_text(chat_id=call.message.chat.id, 
+                          message_id=call.message.message_id,
+                          text=f"Tuyệt vời! Bạn đã chọn **{game_name}**. Bot sẽ bắt đầu gửi dự đoán cho game này.\n"
+                               "Nếu muốn tắt thông báo, dùng lệnh `/tatbot`.\n"
+                               "Nếu muốn đổi game, dùng lại lệnh `/chaybot`.",
+                          parse_mode='Markdown')
+    
+    if not bot_enabled_global:
+        bot.send_message(call.message.chat.id, f"⚠️ Lưu ý: Bot dự đoán hiện đang tạm dừng toàn cục bởi Admin. Lý do: `{bot_disable_reason_global}`. Bạn sẽ nhận thông báo khi bot được mở lại.", parse_mode='Markdown')
+
+
+@bot.message_handler(commands=['tatbot'])
+def disable_user_predictions(message):
+    user_id = str(message.chat.id)
+    
+    if user_id not in user_data or not user_data[user_id].get('receiving_predictions', False):
+        bot.reply_to(message, "Bạn chưa bật nhận thông báo dự đoán.")
+        return
+
+    user_data[user_id]['receiving_predictions'] = False
+    save_user_data(user_data)
+    bot.reply_to(message, "❌ Bạn đã tắt nhận thông báo dự đoán.")
+
+@bot.message_handler(commands=['lichsu'])
+def show_prediction_history_command(message):
+    args = telebot.util.extract_arguments(message.text).split()
+    user_id = str(message.chat.id)
+
+    game_name = None
+    if args and args[0] in GAME_APIS:
+        game_name = args[0]
+    elif user_id in user_data and user_data[user_id].get('preferred_game'):
+        game_name = user_data[user_id]['preferred_game']
+    
+    if not game_name:
+        bot.reply_to(message, "Vui lòng chỉ định game muốn xem lịch sử (ví dụ: `/lichsu LuckyWin`) hoặc bật nhận dự đoán cho một game trước.", parse_mode='Markdown')
+        return
+
+    if not prediction_history[game_name]:
+        bot.reply_to(message, f"Hiện chưa có lịch sử dự đoán nào cho game **{game_name}**.", parse_mode='Markdown')
+        return
+    
+    history_text = f"📜 **LỊCH SỬ 10 PHIÊN GẦN NHẤT - {game_name.upper()}** 📜\n\n"
+    for entry in reversed(prediction_history[game_name]): # Hiển thị các phiên mới nhất trước
+        history_text += f"- {entry}\n"
+    
+    bot.reply_to(message, history_text, parse_mode='Markdown')
+
+
+# --- Lệnh Admin ---
+
+@bot.message_handler(commands=['taokey'])
+def generate_key_command(message):
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
+        return
+    
+    args = telebot.util.extract_arguments(message.text).split()
+    if len(args) < 2:
+        bot.reply_to(message, "Cú pháp sai. Ví dụ:\n"
+                              "`/taokey <giá_trị> <đơn_vị> [số_lượng]`\n"
+                              "Ví dụ: `/taokey 1 ngày 5` (tạo 5 key 1 ngày)\n"
+                              "Hoặc: `/taokey 24 giờ` (tạo 1 key 24 giờ)", parse_mode='Markdown')
+        return
+    
+    try:
+        value = int(args[0])
+        unit = args[1].lower()
+        quantity = int(args[2]) if len(args) > 2 and args[2].isdigit() else 1 # Mặc định tạo 1 key nếu không có số lượng
         
-    bot.send_message(message.chat.id, response_text)
-
-@bot.message_handler(commands=['giahan'])
-def extend_subscription(message):
-    update_user_activity(message.chat.id)
-    if not is_ctv(message.chat.id):
-        bot.send_message(message.chat.id, "Bạn không có quyền sử dụng lệnh này.")
-        return
-
-    args = message.text.split()
-    if len(args) != 3:
-        bot.send_message(message.chat.id, "Cú pháp không đúng. Sử dụng: `/giahan <user_id> <số_ngày>`")
-        return
-
-    try:
-        target_user_id = int(args[1])
-        days_to_add = int(args[2])
-        if days_to_add <= 0:
-            bot.send_message(message.chat.id, "Số ngày gia hạn phải lớn hơn 0.")
+        if unit not in ['ngày', 'giờ']:
+            bot.reply_to(message, "Đơn vị không hợp lệ. Chỉ chấp nhận `ngày` hoặc `giờ`.", parse_mode='Markdown')
+            return
+        if value <= 0 or quantity <= 0:
+            bot.reply_to(message, "Giá trị hoặc số lượng phải lớn hơn 0.", parse_mode='Markdown')
             return
 
-        with data_lock:
-            if target_user_id not in user_data:
-                user_data[target_user_id] = {'expires': None, 'role': 'user', 'last_active': None, 'notify_enabled': False}
+        created_keys_list = []
+        for _ in range(quantity):
+            new_key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8)) # 8 ký tự ngẫu nhiên
+            generated_keys[new_key] = {
+                "created_by": str(message.chat.id),
+                "created_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "value": value,
+                "unit": unit,
+                "limit": 1, # Mặc định mỗi key chỉ dùng 1 lần
+                "used_count": 0,
+                "activated_by": None,
+                "activated_time": None
+            }
+            created_keys_list.append(new_key)
+        
+        save_keys()
+        
+        response_text = f"✅ Đã tạo thành công {quantity} key gia hạn **{value} {unit}**:\n\n"
+        response_text += "\n".join([f"`{code}`" for code in created_keys_list])
+        response_text += "\n\n_(Các key này chưa được sử dụng)_"
+        
+        bot.reply_to(message, response_text, parse_mode='Markdown')
 
-            current_expiry = user_data[target_user_id]['expires']
-            new_expiry = datetime.now() if current_expiry is None or current_expiry < datetime.now() else current_expiry
-            new_expiry += timedelta(days=days_to_add)
-            
-            user_data[target_user_id]['expires'] = new_expiry
-            save_user_data()
+    except ValueError:
+        bot.reply_to(message, "Giá trị hoặc số lượng không hợp lệ. Vui lòng nhập số nguyên.", parse_mode='Markdown')
+    except Exception as e:
+        bot.reply_to(message, f"Đã xảy ra lỗi khi tạo key: {e}", parse_mode='Markdown')
 
-        bot.send_message(message.chat.id, f"Đã gia hạn thành công cho người dùng `{target_user_id}` thêm {days_to_add} ngày. Hạn sử dụng mới: {new_expiry.strftime('%Y-%m-%d %H:%M:%S')}")
+@bot.message_handler(commands=['lietkekey'])
+def list_keys_command(message):
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
+        return
+    
+    if not generated_keys:
+        bot.reply_to(message, "Chưa có key nào được tạo.")
+        return
+    
+    response_text = "🔑 **DANH SÁCH KEY ĐÃ TẠO** 🔑\n\n"
+    for key_str, key_info in generated_keys.items():
+        status = "Đã dùng" if key_info.get('used_count', 0) >= key_info.get('limit', 1) else "Chưa dùng"
+        if key_info.get('used_count', 0) > 0:
+            status += f" ({key_info.get('used_count')}/{key_info.get('limit', 1)})"
+        
+        response_text += (
+            f"`{key_str}` - `{key_info['value']} {key_info['unit']}` | Trạng thái: **{status}**\n"
+            f"   _Tạo bởi: {key_info.get('created_by', 'N/A')} vào {key_info.get('created_time', 'N/A')}_\n"
+        )
+        if key_info.get('activated_by'):
+            activated_username = user_data.get(str(key_info['activated_by']), {}).get('username', key_info['activated_by'])
+            response_text += f"   _Kích hoạt bởi: @{activated_username} vào {key_info.get('activated_time', 'N/A')}_\n"
+        response_text += "\n"
+    
+    bot.reply_to(message, response_text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['xoakey'])
+def delete_key_command(message):
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
+        return
+    
+    key_to_delete = telebot.util.extract_arguments(message.text)
+    if not key_to_delete:
+        bot.reply_to(message, "Vui lòng nhập key muốn xóa. Ví dụ: `/xoakey ABCXYZ`", parse_mode='Markdown')
+        return
+    
+    if key_to_delete in generated_keys:
+        del generated_keys[key_to_delete]
+        save_keys()
+        bot.reply_to(message, f"✅ Đã xóa key `{key_to_delete}`.")
+    else:
+        bot.reply_to(message, f"❌ Key `{key_to_delete}` không tồn tại.")
+
+@bot.message_handler(commands=['themadmin'])
+def add_admin_command(message):
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
+        return
+    
+    args = telebot.util.extract_arguments(message.text).split()
+    if not args or not args[0].isdigit():
+        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/themadmin <id_nguoi_dung>`", parse_mode='Markdown')
+        return
+    
+    target_user_id_str = args[0]
+    
+    if target_user_id_str not in user_data:
+        # Nếu user chưa từng start bot, tạo entry mới
+        user_data[target_user_id_str] = {
+            'username': "UnknownUser",
+            'expiry_date': None,
+            'is_admin': True,
+            'receiving_predictions': False,
+            'preferred_game': None
+        }
+    else:
+        user_data[target_user_id_str]['is_admin'] = True
+    
+    save_user_data(user_data)
+    bot.reply_to(message, f"Đã cấp quyền Admin cho user ID `{target_user_id_str}`.")
+    try:
+        bot.send_message(int(target_user_id_str), "🎉 Bạn đã được cấp quyền Admin!")
+    except Exception:
+        pass
+
+@bot.message_handler(commands=['xoaadmin'])
+def remove_admin_command(message):
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
+        return
+    
+    args = telebot.util.extract_arguments(message.text).split()
+    if not args or not args[0].isdigit():
+        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/xoaadmin <id_nguoi_dung>`", parse_mode='Markdown')
+        return
+    
+    target_user_id_str = args[0]
+
+    if int(target_user_id_str) in SUPER_ADMIN_IDS:
+        bot.reply_to(message, "Bạn không thể xóa quyền admin của Super Admin.")
+        return
+
+    if target_user_id_str in user_data and user_data[target_user_id_str].get('is_admin'):
+        user_data[target_user_id_str]['is_admin'] = False
+        save_user_data(user_data)
+        bot.reply_to(message, f"Đã xóa quyền Admin của user ID `{target_user_id_str}`.")
         try:
-            bot.send_message(target_user_id, f"Tài khoản của bạn đã được gia hạn thêm {days_to_add} ngày. Hạn sử dụng mới: {new_expiry.strftime('%Y-%m-%d %H:%M:%S')}")
-            # Sau khi gia hạn, bật thông báo cho người dùng đó (nếu chưa bật)
-            with data_lock:
-                if target_user_id in user_data and not user_data[target_user_id]['notify_enabled']:
-                    user_data[target_user_id]['notify_enabled'] = True
-                    save_user_data()
-                    bot.send_message(target_user_id, "Thông báo dự đoán tự động đã được bật lại cho tài khoản của bạn.")
-        except Exception as e:
-            logger.warning(f"Could not notify user {target_user_id} about extension: {e}")
-            
-    except ValueError:
-        bot.send_message(message.chat.id, "ID người dùng và số ngày phải là số nguyên.")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"Có lỗi xảy ra: {e}")
-        logger.error(f"Error in /giahan: {e}")
+            bot.send_message(int(target_user_id_str), "❌ Quyền Admin của bạn đã bị gỡ bỏ.")
+        except Exception:
+            pass
+    else:
+        bot.reply_to(message, f"User ID `{target_user_id_str}` không phải Admin hoặc không tồn tại.")
 
-@bot.message_handler(commands=['ctv'])
-def grant_ctv_role(message):
-    update_user_activity(message.chat.id)
+@bot.message_handler(commands=['danhsachadmin'])
+def list_admins_command(message):
     if not is_admin(message.chat.id):
-        bot.send_message(message.chat.id, "Bạn không có quyền sử dụng lệnh này. Chỉ Admin chính mới được cấp quyền CTV.")
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
+        return
+    
+    admin_list = []
+    for user_id_str, user_info in user_data.items():
+        if user_info.get('is_admin'):
+            username = user_info.get('username', f"ID: {user_id_str}")
+            admin_list.append(f"- @{username} (ID: `{user_id_str}`)")
+            
+    if not admin_list:
+        bot.reply_to(message, "Chưa có Admin nào được thêm vào hệ thống.")
         return
 
-    args = message.text.split()
-    if len(args) != 2:
-        bot.send_message(message.chat.id, "Cú pháp không đúng. Sử dụng: `/ctv <user_id>`")
-        return
+    response_text = "🛡️ **DANH SÁCH ADMIN** 🛡️\n\n" + "\n".join(admin_list)
+    bot.reply_to(message, response_text, parse_mode='Markdown')
 
-    try:
-        target_user_id = int(args[1])
-        if target_user_id == ADMIN_ID:
-            bot.send_message(message.chat.id, "Không thể cấp quyền CTV cho chính Admin.")
-            return
-
-        with data_lock:
-            if target_user_id not in user_data:
-                user_data[target_user_id] = {'expires': None, 'role': 'user', 'last_active': None, 'notify_enabled': False}
-            
-            user_data[target_user_id]['role'] = 'ctv'
-            save_user_data()
-        bot.send_message(message.chat.id, f"Đã cấp quyền CTV cho người dùng `{target_user_id}`.")
-        try:
-            bot.send_message(target_user_id, "Bạn đã được cấp quyền Cộng tác viên (CTV) và có thể sử dụng các lệnh quản lý như `/giahan` và `/full`.")
-        except Exception as e:
-            logger.warning(f"Could not notify user {target_user_id} about CTV role: {e}")
-            
-    except ValueError:
-        bot.send_message(message.chat.id, "ID người dùng phải là số nguyên.")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"Có lỗi xảy ra: {e}")
-        logger.error(f"Error in /ctv: {e}")
-
-@bot.message_handler(commands=['xoactv'])
-def revoke_ctv_role(message):
-    update_user_activity(message.chat.id)
+@bot.message_handler(commands=['broadcast'])
+def send_broadcast(message):
     if not is_admin(message.chat.id):
-        bot.send_message(message.chat.id, "Bạn không có quyền sử dụng lệnh này. Chỉ Admin chính mới được xóa quyền CTV.")
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
         return
-
-    args = message.text.split()
-    if len(args) != 2:
-        bot.send_message(message.chat.id, "Cú pháp không đúng. Sử dụng: `/xoactv <user_id>`")
-        return
-
-    try:
-        target_user_id = int(args[1])
-        if target_user_id == ADMIN_ID:
-            bot.send_message(message.chat.id, "Không thể xóa quyền CTV của chính Admin.")
-            return
-
-        with data_lock:
-            if target_user_id in user_data and user_data[target_user_id].get('role') == 'ctv':
-                user_data[target_user_id]['role'] = 'user'
-                save_user_data()
-                bot.send_message(message.chat.id, f"Đã xóa quyền CTV của người dùng `{target_user_id}`.")
-                try:
-                    bot.send_message(target_user_id, "Quyền Cộng tác viên (CTV) của bạn đã bị thu hồi.")
-                except Exception as e:
-                    logger.warning(f"Could not notify user {target_user_id} about CTV role removal: {e}")
-            else:
-                bot.send_message(message.chat.id, f"Người dùng `{target_user_id}` không phải là CTV hoặc không tồn tại.")
-            
-    except ValueError:
-        bot.send_message(message.chat.id, "ID người dùng phải là số nguyên.")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"Có lỗi xảy ra: {e}")
-        logger.error(f"Error in /xoactv: {e}")
-
-@bot.message_handler(commands=['tb'])
-def send_broadcast_message(message):
-    update_user_activity(message.chat.id)
-    if not is_admin(message.chat.id):
-        bot.send_message(message.chat.id, "Bạn không có quyền sử dụng lệnh này. Chỉ Admin mới được gửi thông báo.")
-        return
-
-    broadcast_text = message.text[len('/tb '):].strip()
+    
+    broadcast_text = telebot.util.extract_arguments(message.text)
     if not broadcast_text:
-        bot.send_message(message.chat.id, "Vui lòng nhập nội dung thông báo sau lệnh /tb. Ví dụ: `/tb Bot sẽ bảo trì vào lúc 3h sáng.`")
+        bot.reply_to(message, "Vui lòng nhập nội dung thông báo. Ví dụ: `/broadcast Bot sẽ bảo trì vào 2h sáng mai.`", parse_mode='Markdown')
         return
-
+    
     success_count = 0
     fail_count = 0
-    
-    with data_lock:
-        users_to_notify = list(user_data.keys()) # Lấy danh sách user_id để tránh lỗi thay đổi kích thước khi lặp
-
-    total_users = len(users_to_notify)
-    bot.send_message(message.chat.id, f"Đang gửi thông báo tới {total_users} người dùng. Quá trình này có thể mất một thời gian.")
-
-    for user_id in users_to_notify:
+    for user_id_str in list(user_data.keys()):
         try:
-            bot.send_message(user_id, f"📢 **THÔNG BÁO TỪ ADMIN:**\n\n{broadcast_text}")
+            bot.send_message(int(user_id_str), f"📢 **THÔNG BÁO TỪ ADMIN** 📢\n\n{broadcast_text}", parse_mode='Markdown')
             success_count += 1
-            time.sleep(0.1) # Small delay to avoid hitting Telegram API limits
-        except Exception as e:
+            time.sleep(0.1) # Tránh bị rate limit
+        except telebot.apihelper.ApiTelegramException as e:
+            print(f"Không thể gửi thông báo cho user {user_id_str}: {e}")
             fail_count += 1
-            logger.warning(f"Failed to send broadcast to user {user_id}: {e}")
-    
-    bot.send_message(message.chat.id, f"Hoàn tất gửi thông báo.\nThành công: {success_count}\nThất bại: {fail_count}")
-    logger.info(f"Broadcast sent: Success={success_count}, Failed={fail_count}")
+            if "bot was blocked by the user" in str(e) or "user is deactivated" in str(e):
+                print(f"Người dùng {user_id_str} đã chặn bot hoặc bị vô hiệu hóa.")
+        except Exception as e:
+            print(f"Lỗi không xác định khi gửi thông báo cho user {user_id_str}: {e}")
+            fail_count += 1
+            
+    bot.reply_to(message, f"Đã gửi thông báo đến {success_count} người dùng. Thất bại: {fail_count}.")
 
-# --- BACKGROUND TASK ĐỂ KIỂM TRA PHIÊN MỚI VÀ GỬI THÔNG BÁO (MỚI) ---
-def send_latest_prediction_to_user(user_id):
-    global session_history
-    with data_lock:
-        current_session_history = list(session_history) # Lấy bản sao lịch sử để dự đoán
-    
-    if not current_session_history:
-        bot.send_message(user_id, "Bot đang thu thập dữ liệu phiên. Vui lòng thử lại sau ít phút.")
+@bot.message_handler(commands=['tatbot_global'])
+def disable_bot_global_command(message):
+    global bot_enabled_global, bot_disable_reason_global
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
         return
 
-    # Lấy 3 phiên gần nhất để hiển thị
-    recent_3_sessions = list(current_session_history)[-3:]
-    recent_3_sessions_text = "\n".join([
-        f"- Phiên `{s['Phien']}`: Xúc xắc {s['Xuc_xac_1']},{s['Xuc_xac_2']},{s['Xuc_xac_3']} | Tổng {s['Tong']} | Kết quả **{s['Ket_qua']}**"
-        for s in recent_3_sessions
-    ])
+    reason = telebot.util.extract_arguments(message.text)
+    if not reason:
+        bot.reply_to(message, "Vui lòng nhập lý do tắt bot toàn cục. Ví dụ: `/tatbot_global Bot đang bảo trì.`", parse_mode='Markdown')
+        return
 
-    final_prediction, gemini_raw_prediction = predict_tai_xiu_advanced(current_session_history)
-
-    message_text = f"""
-🎲 **Cập Nhật Phiên Tài Xỉu Mới Nhất!** 🎲
-------------------------------
-**3 Phiên Gần Nhất:**
-{recent_3_sessions_text}
-------------------------------
-🔮 **Dự Đoán Phiên Tiếp Theo:**
-**{final_prediction}**
-
-**(Độ chính xác được tối ưu bởi 2 AI học liên tục)**
-    """
-    try:
-        bot.send_message(user_id, message_text, parse_mode='Markdown')
-        logger.info(f"Sent prediction update to user {user_id}. Prediction: {final_prediction}")
-    except Exception as e:
-        logger.error(f"Could not send prediction message to user {user_id}: {e}")
-
-
-def check_for_new_sessions():
-    global last_notified_session_id, session_history
-    while True:
-        try:
-            current_data = fetch_tai_xiu_data()
-            if current_data and isinstance(current_data, dict):
-                current_session_id = current_data.get("Phien")
-                
-                with data_lock:
-                    # Kiểm tra và thêm phiên mới vào lịch sử
-                    # Tránh thêm trùng lặp nếu API trả về cùng một phiên nhiều lần
-                    if not session_history or current_session_id != session_history[-1].get("Phien"):
-                        session_history.append(current_data)
-                        logger.info(f"New session {current_session_id} added to history.")
-
-                        # Nếu đây là một phiên hoàn toàn mới chưa được thông báo
-                        if current_session_id != last_notified_session_id:
-                            logger.info(f"New session detected: {current_session_id}")
-                            last_notified_session_id = current_session_id
-
-                            with data_lock:
-                                # Lặp qua tất cả người dùng và gửi thông báo nếu họ có quyền truy cập và đã bật thông báo
-                                active_users_for_notification = [
-                                    uid for uid, info in user_data.items()
-                                    if has_access(uid) and info.get('notify_enabled', False)
-                                ]
-                            
-                            if active_users_for_notification:
-                                logger.info(f"Sending new session notification to {len(active_users_for_notification)} users.")
-                                for user_id in active_users_for_notification:
-                                    send_latest_prediction_to_user(user_id)
-                                    time.sleep(0.05) # Delay nhỏ giữa các tin nhắn để tránh flood limit
-
-            else:
-                logger.warning("No valid Tai Xiu data received from API.")
-        except Exception as e:
-            logger.error(f"Error in check_for_new_sessions: {e}")
-        
-        time.sleep(POLLING_INTERVAL)
-
-# --- MAIN BOT POLLING ---
-def start_bot_polling():
-    logger.info("Bot started polling...")
-    print("Bot đang khởi động...")
+    bot_enabled_global = False
+    bot_disable_reason_global = reason
+    bot.reply_to(message, f"✅ Bot dự đoán đã được tắt TOÀN CỤC bởi Admin `{message.from_user.username or message.from_user.first_name}`.\nLý do: `{reason}`", parse_mode='Markdown')
     
-    # Khởi động luồng nền để kiểm tra phiên mới
-    notification_thread = Thread(target=check_for_new_sessions)
-    notification_thread.daemon = True # Đặt luồng là daemon để nó tự tắt khi luồng chính tắt
-    notification_thread.start()
+@bot.message_handler(commands=['mokbot_global'])
+def enable_bot_global_command(message):
+    global bot_enabled_global, bot_disable_reason_global
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
+        return
 
-    bot.infinity_polling()
+    if bot_enabled_global:
+        bot.reply_to(message, "Bot dự đoán đã và đang hoạt động toàn cục rồi.")
+        return
 
-if __name__ == "__main__":
-    start_bot_polling()
+    bot_enabled_global = True
+    bot_disable_reason_global = "Không có"
+    bot.reply_to(message, "✅ Bot dự đoán đã được mở lại TOÀN CỤC bởi Admin.")
 
+# --- Flask Routes cho Keep-Alive ---
+@app.route('/')
+def home():
+    return "Bot is alive and running!"
+
+@app.route('/health')
+def health_check():
+    return "OK", 200
+
+# --- Khởi tạo bot và các luồng khi Flask app khởi động ---
+@app.before_request
+def start_bot_threads():
+    global bot_initialized
+    with bot_init_lock:
+        if not bot_initialized:
+            print("Initializing bot and prediction threads...")
+            # Load initial data
+            load_user_data()
+            load_keys()
+
+            # Start prediction loop in a separate thread
+            prediction_thread = Thread(target=prediction_loop, args=(Event(),)) # Pass a new Event for each run
+            prediction_thread.daemon = True
+            prediction_thread.start()
+            print("Prediction loop thread started.")
+
+            # Start bot polling in a separate thread
+            polling_thread = Thread(target=bot.infinity_polling, kwargs={'none_stop': True})
+            polling_thread.daemon = True
+            polling_thread.start()
+            print("Telegram bot polling thread started.")
+            
+            bot_initialized = True
+
+# --- Điểm khởi chạy chính cho Gunicorn/Render ---
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    print(f"Starting Flask app locally on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=True)
