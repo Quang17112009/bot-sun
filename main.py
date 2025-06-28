@@ -13,7 +13,7 @@ from flask import Flask, request
 
 # --- Cấu hình Bot (ĐẶT TRỰC TIẾP TẠY ĐÂY) ---
 # THAY THẾ 'YOUR_BOT_TOKEN_HERE' BẰNG TOKEN THẬT CỦA BẠN
-BOT_TOKEN = "7820739987:AAE_eU2JPZH7u6KnDRq31_l4tn64AD_8f6s" 
+BOT_TOKEN = "8137068939:AAG19xO92yXsz_d9vz_m2aJW2Wh8JZnvSPQ" 
 # THAY THẾ BẰNG ID ADMIN GỐC CỦA BẠN. Admin gốc này sẽ có quyền thêm/xóa admin khác.
 # CHỈ CẦN MỘT ID ADMIN BAN ĐẦU ĐỂ KHỞI TẠO. CÁC ADMIN KHÁC SẼ ĐƯỢC QUẢN LÝ QUA LỆNH.
 SUPER_ADMIN_IDS = [6915752059] 
