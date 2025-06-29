@@ -36,7 +36,7 @@ user_data = {} # {user_id: {...}}
 generated_keys = {} # {key_string: {...}}
 prediction_history = { # Lưu 10 phiên gần nhất cho mỗi game
     "LuckyWin": [],
-    "SunWin": [],
+    "SunWin": [], # SunWin vẫn ở đây
     "B52": [],
     "Hit": []
 }
@@ -44,7 +44,7 @@ prediction_history = { # Lưu 10 phiên gần nhất cho mỗi game
 # --- API Endpoints for each game ---
 GAME_APIS = {
     "LuckyWin": "https://apiluck.onrender.com/api/taixiu",
-    "SunWin": "https://apisun.onrender.com/api/taixiu",
+    "SunWin": "https://tooltxnghiau.kesug.com/apisunnghiau.json", # Cập nhật API SunWin tại đây
     "B52": "https://apib52-8y5h.onrender.com/api/taixiu",
     "Hit": "https://apihit-v17r.onrender.com/api/taixiu"
 }
@@ -140,8 +140,48 @@ def fetch_and_parse_api_data(game_name):
             parsed_data["next_prediction"] = prediction_data.get("Ket_qua_du_doan")
             parsed_data["confidence"] = prediction_data.get("Do_tin_cay")
             
-        elif game_name in ["SunWin", "B52", "Hit"]:
-            # Cả ba game này có định dạng tương tự
+        elif game_name == "SunWin": # Cập nhật logic phân tích cho SunWin
+            # Dữ liệu hiện tại không trực tiếp chứa "current_result" hay "current_session"
+            # Nó cung cấp "phien_moi" (next session) và "du_doan" (next prediction)
+            # Chúng ta sẽ cần điều chỉnh cách hiển thị cho người dùng để rõ ràng hơn.
+            # Đối với lịch sử, chúng ta sẽ giả định "phien_moi" là phiên vừa kết thúc,
+            # và "du_doan" là cho phiên "phien_moi".
+
+            # Dựa trên format mới, 'phien_moi' dường như là phiên đã có kết quả
+            # và 'phien_du_doan' là phiên tiếp theo cần dự đoán.
+            # Tuy nhiên, API không cung cấp trực tiếp kết quả của 'phien_moi'.
+            # Để hiển thị kết quả, chúng ta sẽ phải dùng dự đoán trước đó làm kết quả.
+            # Đây là một điểm cần cân nhắc nếu bạn muốn hiển thị kết quả thực sự.
+            # Với API mới, chúng ta chỉ có thể dự đoán cho phiên tiếp theo.
+            # Để có "current_result", chúng ta cần một API trả về kết quả của phiên đã đóng.
+            # Với cấu trúc hiện tại, chúng ta sẽ hiển thị:
+            # - current_session: phien_moi - 1 (giả định)
+            # - current_result: không có dữ liệu trực tiếp, có thể bỏ qua hoặc báo "Đang cập nhật"
+            # - next_prediction: du_doan
+            # - confidence: phan_tram_tai / phan_tram_xiu
+
+            parsed_data["current_session"] = str(data.get("phien_moi", "N/A") - 1) if isinstance(data.get("phien_moi"), int) else "N/A"
+            parsed_data["current_result"] = "Đang cập nhật" # API mới không cung cấp trực tiếp
+            parsed_data["total_score"] = None
+            parsed_data["dice_values"] = None
+            
+            parsed_data["next_prediction"] = data.get("du_doan")
+            
+            # Tính confidence dựa trên phần trăm tài/xỉu lớn hơn
+            phan_tram_tai = data.get("phan_tram_tai", 0)
+            phan_tram_xiu = data.get("phan_tram_xiu", 0)
+            if parsed_data["next_prediction"] and parsed_data["next_prediction"].lower().strip() == "tài":
+                parsed_data["confidence"] = f"{phan_tram_tai}%"
+            elif parsed_data["next_prediction"] and parsed_data["next_prediction"].lower().strip() == "xỉu":
+                 parsed_data["confidence"] = f"{phan_tram_xiu}%"
+            else:
+                parsed_data["confidence"] = "N/A" # Nếu không có dự đoán, không có độ tin cậy
+
+            # Lấy phiên dự đoán trực tiếp từ API nếu có, nếu không thì tính toán
+            parsed_data["next_session"] = data.get("phien_du_doan", parsed_data["current_session"])
+
+        elif game_name in ["B52", "Hit"]:
+            # Cả hai game này có định dạng tương tự
             parsed_data["current_session"] = data.get("current_session")
             parsed_data["current_result"] = data.get("current_result")
             parsed_data["total_score"] = None # API này không trả về tổng điểm trực tiếp
@@ -149,12 +189,14 @@ def fetch_and_parse_api_data(game_name):
             
             parsed_data["next_prediction"] = data.get("prediction")
             parsed_data["confidence"] = f"{data.get('confidence_percent', 0.0)}%" # Thêm %
+            parsed_data["next_session"] = None # Không có trường này từ API
 
         # Xử lý mã hóa cho kết quả và dự đoán
-        if parsed_data.get("current_result"):
-            parsed_data["current_result"] = parsed_data["current_result"].replace("TÃ i", "Tài").replace("Xá»‰u", "Xỉu").replace("X\u1ec9u", "Xỉu")
-        if parsed_data.get("next_prediction"):
-            parsed_data["next_prediction"] = parsed_data["next_prediction"].replace("TÃ i", "Tài").replace("Xá»‰u", "Xỉu").replace("X\u1ec9u", "Xỉu")
+        # Đảm bảo xử lý các ký tự có dấu không đúng mã hóa
+        for key in ["current_result", "next_prediction"]:
+            if parsed_data.get(key):
+                # Thay thế các chuỗi mã hóa không đúng thành tiếng Việt có dấu
+                parsed_data[key] = parsed_data[key].replace("TÃ i", "Tài").replace("Xá»‰u", "Xỉu").replace("X\u1ec9u", "Xỉu").replace("áº¢o", "Ảo").replace("Ã¡o", "ảo")
         
         return parsed_data
     except requests.exceptions.RequestException as e:
@@ -197,33 +239,27 @@ def prediction_loop(stop_event: Event):
                 # print(f"❌ Không lấy được dữ liệu từ API {game_name} hoặc dữ liệu không hợp lệ.")
                 continue
 
-            current_issue_id = parsed_data.get("current_session")
-            current_result = parsed_data.get("current_result")
-            current_total = parsed_data.get("total_score")
-            current_dice = parsed_data.get("dice_values")
-            next_prediction = parsed_data.get("next_prediction")
-            confidence = parsed_data.get("confidence")
+            # Đối với SunWin, chúng ta sẽ sử dụng 'phien_du_doan' từ API làm next_issue_id
+            # và 'phien_moi' làm current_issue_id (cho lịch sử)
+            if game_name == "SunWin":
+                current_issue_id = parsed_data.get("phien_moi") # Đây là phiên mà API đã cung cấp kết quả trước đó hoặc đang chuẩn bị dự đoán
+                next_issue_id = parsed_data.get("next_session") # Đây là phiên sẽ được dự đoán
+                current_result = "N/A (API mới không cung cấp trực tiếp kết quả phiên hiện tại)"
+                current_total = None
+                current_dice = None
+                next_prediction = parsed_data.get("next_prediction")
+                confidence = parsed_data.get("confidence")
 
-            if not all([current_issue_id, current_result, next_prediction, confidence]):
-                print(f"Dữ liệu API {game_name} không đầy đủ. Bỏ qua phiên này.")
-                continue
+                # Để tránh gửi lặp lại dự đoán cho cùng một phiên, chúng ta sẽ theo dõi 'next_issue_id'
+                if next_issue_id == last_issue_ids[game_name]:
+                    continue # Đã xử lý phiên này rồi
 
-            if current_issue_id != last_issue_ids[game_name]:
-                # Tìm phiên tiếp theo (tăng ID lên 1)
-                try:
-                    next_issue_id = str(int(current_issue_id) + 1).zfill(len(str(current_issue_id)))
-                except ValueError:
-                    next_issue_id = "Phiên tiếp theo" # Hoặc xử lý lỗi phù hợp hơn
-                
-                # Lưu vào lịch sử phiên của game tương ứng
+                # Cập nhật lịch sử
                 if len(prediction_history[game_name]) >= 10:
                     prediction_history[game_name].pop(0) 
                 
-                dice_str = f"({', '.join(map(str, current_dice))})" if current_dice else ""
-                total_str = f" (Tổng: **{current_total}**)" if current_total else ""
-
                 prediction_history[game_name].append(
-                    f"Phiên: `{current_issue_id}` | KQ: **{current_result}**{total_str} {dice_str}"
+                    f"Phiên: `{current_issue_id}` | Dự đoán: **{next_prediction}** | Độ tin cậy: **{confidence}**"
                 )
 
                 # Gửi tin nhắn dự đoán tới các người dùng đang theo dõi game này
@@ -234,13 +270,12 @@ def prediction_loop(stop_event: Event):
                         if is_sub:
                             try:
                                 prediction_message = (
-                                    f"🎮 **KẾT QUẢ PHIÊN HIỆN TẠI - {game_name.upper()}** 🎮\n"
-                                    f"Phiên: `{current_issue_id}` | Kết quả: **{current_result}**{total_str} {dice_str}\n\n"
-                                    f"**Dự đoán cho phiên tiếp theo:**\n"
+                                    f"🎮 **DỰ ĐOÁN MỚI - {game_name.upper()}** 🎮\n"
                                     f"🔢 Phiên: `{next_issue_id}`\n"
                                     f"🤖 Dự đoán: **{next_prediction}**\n"
                                     f"📈 Độ tin cậy: **{confidence}**\n"
-                                    f"⚠️ **Hãy đặt cược sớm trước khi phiên kết thúc!**"
+                                    f"⚠️ **Hãy đặt cược sớm trước khi phiên kết thúc!**\n"
+                                    f"_(Kết quả phiên trước không được API mới cung cấp trực tiếp)_"
                                 )
                                 bot.send_message(user_id, prediction_message, parse_mode='Markdown')
                             except telebot.apihelper.ApiTelegramException as e:
@@ -253,14 +288,79 @@ def prediction_loop(stop_event: Event):
 
                 print("-" * 50)
                 print(f"Game: {game_name}")
-                print(f"🎮 Kết quả phiên hiện tại: {current_issue_id} | {current_result}{total_str} {current_dice}")
                 print(f"🔢 Phiên tiếp theo: {next_issue_id}")
                 print(f"🤖 Dự đoán: {next_prediction}")
                 print(f"📈 Độ tin cậy: {confidence}")
                 print("⚠️ Hãy đặt cược sớm trước khi phiên kết thúc!")
                 print("-" * 50)
 
-                last_issue_ids[game_name] = current_issue_id
+                last_issue_ids[game_name] = next_issue_id # Cập nhật last_issue_id bằng next_issue_id cho SunWin
+
+            else: # Logic cho các game khác (LuckyWin, B52, Hit)
+                current_issue_id = parsed_data.get("current_session")
+                current_result = parsed_data.get("current_result")
+                current_total = parsed_data.get("total_score")
+                current_dice = parsed_data.get("dice_values")
+                next_prediction = parsed_data.get("next_prediction")
+                confidence = parsed_data.get("confidence")
+
+                if not all([current_issue_id, current_result, next_prediction, confidence]):
+                    print(f"Dữ liệu API {game_name} không đầy đủ. Bỏ qua phiên này.")
+                    continue
+
+                if current_issue_id != last_issue_ids[game_name]:
+                    # Tìm phiên tiếp theo (tăng ID lên 1)
+                    try:
+                        next_issue_id = str(int(current_issue_id) + 1).zfill(len(str(current_issue_id)))
+                    except ValueError:
+                        next_issue_id = "Phiên tiếp theo" # Hoặc xử lý lỗi phù hợp hơn
+                    
+                    # Lưu vào lịch sử phiên của game tương ứng
+                    if len(prediction_history[game_name]) >= 10:
+                        prediction_history[game_name].pop(0) 
+                    
+                    dice_str = f"({', '.join(map(str, current_dice))})" if current_dice else ""
+                    total_str = f" (Tổng: **{current_total}**)" if current_total else ""
+
+                    prediction_history[game_name].append(
+                        f"Phiên: `{current_issue_id}` | KQ: **{current_result}**{total_str} {dice_str}"
+                    )
+
+                    # Gửi tin nhắn dự đoán tới các người dùng đang theo dõi game này
+                    for user_id_str, user_info in list(user_data.items()):
+                        user_id = int(user_id_str)
+                        if user_info.get('receiving_predictions', False) and user_info.get('preferred_game') == game_name:
+                            is_sub, sub_message = check_key_validity(user_id)
+                            if is_sub:
+                                try:
+                                    prediction_message = (
+                                        f"🎮 **KẾT QUẢ PHIÊN HIỆN TẠI - {game_name.upper()}** 🎮\n"
+                                        f"Phiên: `{current_issue_id}` | Kết quả: **{current_result}**{total_str} {dice_str}\n\n"
+                                        f"**Dự đoán cho phiên tiếp theo:**\n"
+                                        f"🔢 Phiên: `{next_issue_id}`\n"
+                                        f"🤖 Dự đoán: **{next_prediction}**\n"
+                                        f"📈 Độ tin cậy: **{confidence}**\n"
+                                        f"⚠️ **Hãy đặt cược sớm trước khi phiên kết thúc!**"
+                                    )
+                                    bot.send_message(user_id, prediction_message, parse_mode='Markdown')
+                                except telebot.apihelper.ApiTelegramException as e:
+                                    if "bot was blocked by the user" in str(e) or "user is deactivated" in str(e):
+                                        print(f"Người dùng {user_id} đã chặn bot hoặc bị vô hiệu hóa.")
+                                    else:
+                                        print(f"Lỗi gửi tin nhắn cho user {user_id}: {e}")
+                                except Exception as e:
+                                    print(f"Lỗi không xác định khi gửi tin nhắn cho user {user_id}: {e}")
+
+                    print("-" * 50)
+                    print(f"Game: {game_name}")
+                    print(f"🎮 Kết quả phiên hiện tại: {current_issue_id} | {current_result}{total_str} {current_dice}")
+                    print(f"🔢 Phiên tiếp theo: {next_issue_id}")
+                    print(f"🤖 Dự đoán: {next_prediction}")
+                    print(f"📈 Độ tin cậy: {confidence}")
+                    print("⚠️ Hãy đặt cược sớm trước khi phiên kết thúc!")
+                    print("-" * 50)
+
+                    last_issue_ids[game_name] = current_issue_id
 
         time.sleep(5) # Đợi 5 giây trước khi kiểm tra phiên mới
     print("Prediction loop stopped.")
