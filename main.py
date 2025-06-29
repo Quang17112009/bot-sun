@@ -121,13 +121,15 @@ def check_key_validity(user_id):
 def fetch_and_parse_api_data(game_name):
     api_url = GAME_APIS.get(game_name)
     if not api_url:
-        print(f"Không tìm thấy API cho game: {game_name}")
+        print(f"DEBUG: Không tìm thấy API cho game: {game_name}")
         return None
 
     try:
         response = requests.get(api_url)
         response.raise_for_status()
+        raw_data = response.text # Lấy dữ liệu thô để debug
         data = response.json()
+        print(f"DEBUG: RAW Response from {game_name} API ({api_url}): {raw_data[:500]}...") # In 500 ký tự đầu của dữ liệu thô
 
         parsed_data = {}
         if game_name == "LuckyWin":
@@ -139,7 +141,7 @@ def fetch_and_parse_api_data(game_name):
             prediction_data = data.get("Du_doan_phien_tiep_theo_ML", {})
             parsed_data["next_prediction"] = prediction_data.get("Ket_qua_du_doan")
             parsed_data["confidence"] = prediction_data.get("Do_tin_cay")
-            parsed_data["next_session"] = str(int(parsed_data["current_session"]) + 1) if parsed_data["current_session"] else "N/A" # Thêm next_session cho LuckyWin để đồng bộ hóa
+            parsed_data["next_session"] = str(int(parsed_data["current_session"]) + 1) if parsed_data["current_session"] else "N/A"
             
         elif game_name == "SunWin": # Logic phân tích riêng cho SunWin API mới
             parsed_data["current_session"] = data.get("phien_moi") # Phiên hiện tại/vừa kết thúc
@@ -161,7 +163,6 @@ def fetch_and_parse_api_data(game_name):
                 parsed_data["confidence"] = "N/A" 
 
         elif game_name in ["B52", "Hit"]:
-            # Cả hai game này có định dạng tương tự
             parsed_data["current_session"] = data.get("current_session")
             parsed_data["current_result"] = data.get("current_result")
             parsed_data["total_score"] = None 
@@ -169,7 +170,7 @@ def fetch_and_parse_api_data(game_name):
             
             parsed_data["next_prediction"] = data.get("prediction")
             parsed_data["confidence"] = f"{data.get('confidence_percent', 0.0)}%" 
-            parsed_data["next_session"] = str(int(parsed_data["current_session"]) + 1) if parsed_data["current_session"] else "N/A" # Thêm next_session cho B52/Hit để đồng bộ hóa
+            parsed_data["next_session"] = str(int(parsed_data["current_session"]) + 1) if parsed_data["current_session"] else "N/A"
 
         # Xử lý mã hóa cho kết quả và dự đoán (áp dụng chung cho tất cả game)
         for key in ["current_result", "next_prediction"]:
@@ -177,22 +178,20 @@ def fetch_and_parse_api_data(game_name):
                 # Thay thế các chuỗi mã hóa không đúng thành tiếng Việt có dấu
                 parsed_data[key] = parsed_data[key].replace("TÃ i", "Tài").replace("Xá»‰u", "Xỉu").replace("X\u1ec9u", "Xỉu").replace("áº¢o", "Ảo").replace("Ã¡o", "ảo")
         
+        print(f"DEBUG: Parsed data for {game_name}: {parsed_data}") # In dữ liệu đã phân tích
         return parsed_data
     except requests.exceptions.RequestException as e:
-        print(f"Lỗi khi lấy dữ liệu từ API {game_name}: {e}")
+        print(f"ERROR: Lỗi khi lấy dữ liệu từ API {game_name} ({api_url}): {e}")
         return None
     except json.JSONDecodeError:
-        print(f"Lỗi giải mã JSON từ API {game_name}. Phản hồi không phải JSON hợp lệ.")
+        print(f"ERROR: Lỗi giải mã JSON từ API {game_name} ({api_url}). Phản hồi không phải JSON hợp lệ hoặc rỗng. Raw: {raw_data[:500]}")
         return None
     except Exception as e:
-        print(f"Lỗi không xác định khi xử lý API {game_name}: {e}")
+        print(f"ERROR: Lỗi không xác định khi xử lý API {game_name}: {e}")
         return None
 
 # --- Logic chính của Bot dự đoán (chạy trong luồng riêng) ---
 def prediction_loop(stop_event: Event):
-    # Sử dụng dictionary để lưu last_processed_session cho từng game
-    # Đối với SunWin, last_processed_session sẽ là phien_du_doan đã gửi
-    # Đối với các game khác, nó là current_session vừa nhận kết quả
     last_processed_sessions = {game_name: None for game_name in GAME_APIS.keys()}
     global prediction_history
     
@@ -214,6 +213,7 @@ def prediction_loop(stop_event: Event):
         for game_name in active_games:
             parsed_data = fetch_and_parse_api_data(game_name)
             if not parsed_data:
+                print(f"DEBUG: Skipping {game_name} due to failed API fetch or parsing.")
                 continue
 
             current_session = parsed_data.get("current_session")
@@ -222,14 +222,19 @@ def prediction_loop(stop_event: Event):
             dice_values = parsed_data.get("dice_values")
             next_prediction = parsed_data.get("next_prediction")
             confidence = parsed_data.get("confidence")
-            next_session = parsed_data.get("next_session") # Đây là phiên dự đoán
+            next_session = parsed_data.get("next_session")
 
-            if not all([current_session, next_prediction, confidence, next_session]): # next_session là bắt buộc
-                print(f"Dữ liệu API {game_name} không đầy đủ. Bỏ qua phiên này.")
+            # Debug: In ra các giá trị quan trọng trước khi kiểm tra điều kiện
+            print(f"DEBUG: For {game_name}: current_session={current_session}, next_session={next_session}, next_prediction={next_prediction}, confidence={confidence}")
+            print(f"DEBUG: For {game_name}: last_processed_sessions[{game_name}]={last_processed_sessions[game_name]}")
+
+            if not all([current_session, next_prediction, confidence, next_session]):
+                print(f"DEBUG: Dữ liệu API {game_name} không đầy đủ ({current_session}, {next_prediction}, {confidence}, {next_session}). Bỏ qua phiên này.")
                 continue
 
-            # Logic kiểm tra phiên mới để gửi tin nhắn
             if next_session != last_processed_sessions[game_name]:
+                print(f"DEBUG: New session detected for {game_name}: {next_session} (Old: {last_processed_sessions[game_name]})")
+                
                 # Cập nhật lịch sử phiên của game
                 if len(prediction_history[game_name]) >= 10:
                     prediction_history[game_name].pop(0) 
@@ -276,13 +281,14 @@ def prediction_loop(stop_event: Event):
                                         f"⚠️ **Hãy đặt cược sớm trước khi phiên kết thúc!**"
                                     )
                                 bot.send_message(user_id, prediction_message, parse_mode='Markdown')
+                                print(f"DEBUG: Sent prediction message to user {user_id} for {game_name} session {next_session}")
                             except telebot.apihelper.ApiTelegramException as e:
                                 if "bot was blocked by the user" in str(e) or "user is deactivated" in str(e):
-                                    print(f"Người dùng {user_id} đã chặn bot hoặc bị vô hiệu hóa.")
+                                    print(f"ERROR: Người dùng {user_id} đã chặn bot hoặc bị vô hiệu hóa.")
                                 else:
-                                    print(f"Lỗi gửi tin nhắn cho user {user_id}: {e}")
+                                    print(f"ERROR: Lỗi gửi tin nhắn cho user {user_id}: {e}")
                             except Exception as e:
-                                print(f"Lỗi không xác định khi gửi tin nhắn cho user {user_id}: {e}")
+                                print(f"ERROR: Lỗi không xác định khi gửi tin nhắn cho user {user_id}: {e}")
 
                 print("-" * 50)
                 print(f"Game: {game_name}")
@@ -300,6 +306,8 @@ def prediction_loop(stop_event: Event):
                 print("-" * 50)
 
                 last_processed_sessions[game_name] = next_session # Cập nhật phiên đã xử lý
+            else:
+                print(f"DEBUG: {game_name}: Session {next_session} already processed. Waiting for new session...")
 
         time.sleep(5) # Đợi 5 giây trước khi kiểm tra phiên mới
     print("Prediction loop stopped.")
@@ -703,12 +711,12 @@ def send_broadcast(message):
             success_count += 1
             time.sleep(0.1) # Tránh bị rate limit
         except telebot.apihelper.ApiTelegramException as e:
-            print(f"Không thể gửi thông báo cho user {user_id_str}: {e}")
+            print(f"ERROR: Không thể gửi thông báo cho user {user_id_str}: {e}")
             fail_count += 1
             if "bot was blocked by the user" in str(e) or "user is deactivated" in str(e):
                 print(f"Người dùng {user_id_str} đã chặn bot hoặc bị vô hiệu hóa.")
         except Exception as e:
-            print(f"Lỗi không xác định khi gửi thông báo cho user {user_id_str}: {e}")
+            print(f"ERROR: Lỗi không xác định khi gửi thông báo cho user {user_id_str}: {e}")
             fail_count += 1
             
     bot.reply_to(message, f"Đã gửi thông báo đến {success_count} người dùng. Thất bại: {fail_count}.")
@@ -783,4 +791,3 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"Starting Flask app locally on port {port}")
     app.run(host='0.0.0.0', port=port, debug=True)
-
